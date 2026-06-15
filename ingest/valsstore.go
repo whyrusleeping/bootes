@@ -39,6 +39,7 @@ type ValsStore struct {
 	logger *slog.Logger
 
 	mu      sync.Mutex
+	drain   *sync.Cond // signalled when a flush frees buffer space
 	records []valsgo.KV
 	links   []valsgo.KV
 	closed  bool
@@ -52,7 +53,9 @@ const (
 	valsRecordZone   = "records"
 	valsBacklinkZone = "backlinks"
 	valsCursorKey    = "cursor/firehose"
-	valsFlushSize    = 2000
+	valsFlushSize    = 2000  // soft: signal a flush once this many entries are buffered
+	valsMaxBatch     = 5000  // hard: max entries per PutBatch call (bounds per-call memory)
+	valsBufferCap    = 50000 // hard: total buffered entries before push() blocks (backpressure)
 	valsFlushAge     = 2 * time.Second
 )
 
@@ -83,6 +86,7 @@ func NewValsStore(nodes map[uint32]string, logger *slog.Logger) (*ValsStore, err
 		flushNow: make(chan struct{}, 1),
 		done:     make(chan struct{}),
 	}
+	s.drain = sync.NewCond(&s.mu)
 	s.flushedWg.Add(1)
 	go s.flushLoop()
 	return s, nil
@@ -141,8 +145,16 @@ func (s *ValsStore) Write(backlinks []BacklinkRecord) {
 
 func (s *ValsStore) push(buf *[]valsgo.KV, kv valsgo.KV) {
 	s.mu.Lock()
+	// Backpressure: if the buffers are already at their hard cap the flusher is
+	// behind (slow cluster or mid-retry). Block the producer until a flush
+	// frees space rather than buffering without bound — an unbounded buffer
+	// under a heavy backfill once drove RSS to ~83 GB and nearly OOM'd the box.
+	// Never block once closed (the final drain must not deadlock).
+	for !s.closed && len(s.records)+len(s.links) >= valsBufferCap {
+		s.drain.Wait()
+	}
 	*buf = append(*buf, kv)
-	full := len(*buf) >= valsFlushSize
+	full := len(s.records)+len(s.links) >= valsFlushSize
 	s.mu.Unlock()
 	if full {
 		select {
@@ -172,15 +184,29 @@ func (s *ValsStore) flush() {
 	s.mu.Lock()
 	records, links := s.records, s.links
 	s.records, s.links = nil, nil
+	s.drain.Broadcast() // buffer space freed — wake any producers blocked in push
 	s.mu.Unlock()
 	s.flushBatch(valsRecordZone, records)
 	s.flushBatch(valsBacklinkZone, links)
 }
 
-// flushBatch writes one buffered batch with bounded retries (a cluster
+// flushBatch writes a buffered batch, split into PutBatch calls of at most
+// valsMaxBatch entries so a single call's memory and wire frames stay bounded
+// no matter how large the buffer grew.
+func (s *ValsStore) flushBatch(zone string, kvs []valsgo.KV) {
+	for start := 0; start < len(kvs); start += valsMaxBatch {
+		end := start + valsMaxBatch
+		if end > len(kvs) {
+			end = len(kvs)
+		}
+		s.flushChunk(zone, kvs[start:end])
+	}
+}
+
+// flushChunk writes one bounded chunk with bounded retries (a cluster
 // reconfiguration mid-batch surfaces as an error once; the client refreshes
 // and the retry lands).
-func (s *ValsStore) flushBatch(zone string, kvs []valsgo.KV) {
+func (s *ValsStore) flushChunk(zone string, kvs []valsgo.KV) {
 	if len(kvs) == 0 {
 		return
 	}
@@ -251,6 +277,7 @@ func (s *ValsStore) Close() error {
 		return nil
 	}
 	s.closed = true
+	s.drain.Broadcast() // release any producers blocked on the buffer cap
 	s.mu.Unlock()
 	close(s.done)
 	s.flushedWg.Wait()
