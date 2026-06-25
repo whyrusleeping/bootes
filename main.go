@@ -50,6 +50,16 @@ func main() {
 				Usage:   "Firehose-only: skip the repo pump and backfiller",
 				Sources: cli.EnvVars("ATTIE_DISABLE_BACKFILL"),
 			},
+			&cli.StringFlag{
+				Name:    "shard",
+				Usage:   "Backfill only repos in shard n of K (\"n/K\"): partitions the repo pump by DID hash so multiple instances split the network. Default: all repos.",
+				Sources: cli.EnvVars("ATTIE_SHARD"),
+			},
+			&cli.BoolFlag{
+				Name:    "disable-firehose",
+				Usage:   "Skip the live firehose subscription (for backfill-only worker shards; run exactly one instance WITHOUT this to consume the firehose)",
+				Sources: cli.EnvVars("ATTIE_DISABLE_FIREHOSE"),
+			},
 			&cli.StringSliceFlag{
 				Name:    "clickhouse-bootstrap-nodes",
 				Usage:   "All ClickHouse node addresses for bootstrap (CREATE DATABASE runs on each)",
@@ -117,6 +127,30 @@ func main() {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// parseShard parses a "n/K" shard spec. Empty -> (0, 1) meaning "all repos".
+// Requires 0 <= n < K.
+func parseShard(s string) (int, int, error) {
+	if s == "" {
+		return 0, 1, nil
+	}
+	nStr, kStr, ok := strings.Cut(s, "/")
+	if !ok {
+		return 0, 0, fmt.Errorf("expected n/K, got %q", s)
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(nStr))
+	if err != nil {
+		return 0, 0, fmt.Errorf("bad shard index %q", nStr)
+	}
+	k, err := strconv.Atoi(strings.TrimSpace(kStr))
+	if err != nil {
+		return 0, 0, fmt.Errorf("bad shard count %q", kStr)
+	}
+	if k < 1 || n < 0 || n >= k {
+		return 0, 0, fmt.Errorf("require 0 <= n < K, got %d/%d", n, k)
+	}
+	return n, k, nil
 }
 
 // parseValsNodes parses "1@host:port,2@host:port,..." into the valsgo node map.
@@ -227,6 +261,11 @@ func run(ctx context.Context, cmd *cli.Command) error {
 		deleteQueue = ingest.NewDeleteQueue(conn, logger, metrics)
 	}
 
+	shardN, shardK, err := parseShard(cmd.String("shard"))
+	if err != nil {
+		return fmt.Errorf("--shard: %w", err)
+	}
+
 	ingester, err := ingest.NewIngester(ingest.Config{
 		RelayURL:          relayURL,
 		BackfillDBPath:    backfillDB,
@@ -235,6 +274,9 @@ func run(ctx context.Context, cmd *cli.Command) error {
 		Metrics:           metrics,
 		Cursors:           cursors,
 		DisableBackfill:   cmd.Bool("disable-backfill"),
+		DisableFirehose:   cmd.Bool("disable-firehose"),
+		ShardN:            shardN,
+		ShardK:            shardK,
 	}, writer, backlinkWriter, deleteQueue, logger)
 	if err != nil {
 		return fmt.Errorf("failed to create ingester: %w", err)

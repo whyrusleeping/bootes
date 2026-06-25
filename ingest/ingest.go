@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -57,6 +58,14 @@ type Ingester struct {
 	cursorDone chan struct{}
 
 	parallelBackfills int
+
+	// Horizontal sharding: this instance backfills only repos whose DID hashes
+	// into shard shardN of shardK (shardK<=1 means "all repos"). Lets several
+	// bootes processes split the network with no overlap. disableFirehose skips
+	// the live firehose entirely (worker shards; one primary runs it).
+	shardN          int
+	shardK          int
+	disableFirehose bool
 }
 
 // Config holds ingester configuration
@@ -72,6 +81,12 @@ type Config struct {
 	Cursors CursorStore
 	// DisableBackfill skips the repo pump + backfiller: firehose-only mode.
 	DisableBackfill bool
+	// DisableFirehose skips the live firehose subscription: backfill-only mode
+	// (for worker shards; run one primary with the firehose enabled).
+	DisableFirehose bool
+	// ShardN/ShardK partition the repo pump by DID hash (ShardK<=1 = all repos).
+	ShardN int
+	ShardK int
 }
 
 // NewIngester creates a new ingester
@@ -111,6 +126,9 @@ func NewIngester(cfg Config, writer RecordSink, backlinkWriter BacklinkSink, del
 		labelStore:        cfg.LabelStore,
 		cursorDone:        make(chan struct{}),
 		parallelBackfills: cfg.ParallelBackfills,
+		shardN:            cfg.ShardN,
+		shardK:            cfg.ShardK,
+		disableFirehose:   cfg.DisableFirehose,
 	}
 
 	// Create backfiller with indigo's backfill package
@@ -168,8 +186,25 @@ func (i *Ingester) Run(ctx context.Context) error {
 		go i.pumpRepos(ctx)
 	}
 
-	// Run firehose consumer
+	// Run firehose consumer (unless this is a backfill-only worker shard)
+	if i.disableFirehose {
+		i.logger.Info("firehose disabled (backfill-only); running until stopped")
+		<-ctx.Done()
+		return ctx.Err()
+	}
 	return i.runFirehose(ctx)
+}
+
+// inShard reports whether a repo DID belongs to this instance's shard. With
+// shardK<=1 (the default) every DID is in-shard. Uses FNV-1a so the partition
+// is stable across instances and runs.
+func (i *Ingester) inShard(did string) bool {
+	if i.shardK <= 1 {
+		return true
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(did))
+	return int(h.Sum32()%uint32(i.shardK)) == i.shardN
 }
 
 // loadCursor loads the firehose cursor from ClickHouse
@@ -230,7 +265,8 @@ func (i *Ingester) pumpRepos(ctx context.Context) {
 	total := progress.TotalPumped
 	lastSave := time.Now()
 
-	i.logger.Info("starting repo pump", "resuming_from", cursor, "total_so_far", total)
+	i.logger.Info("starting repo pump", "resuming_from", cursor, "total_so_far", total,
+		"shard", i.shardN, "shard_count", i.shardK, "firehose_enabled", !i.disableFirehose)
 
 	for {
 		select {
@@ -256,6 +292,9 @@ func (i *Ingester) pumpRepos(ctx context.Context) {
 		}
 
 		for _, r := range resp.Repos {
+			if !i.inShard(r.Did) {
+				continue
+			}
 			if err := i.store.EnqueueJob(ctx, r.Did); err != nil {
 				// Ignore duplicate errors
 				if !strings.Contains(err.Error(), "already exists") {
