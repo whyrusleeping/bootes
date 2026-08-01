@@ -3,8 +3,10 @@ package ingest
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,8 +31,9 @@ import (
 //     remain until a future cleanup pass. Documented limitation.
 //   - cursor    → default-zone key "cursor/firehose".
 //
-// Writes are buffered and flushed through the batch group-commit path, with
-// bounded retries (a refreshed ring + retry on cluster reconfiguration).
+// Writes are buffered and flushed through the batch group-commit path. Hard
+// failures have bounded retries; healthy Busy refusals apply lossless
+// backpressure and retry until the cluster has maintenance headroom.
 //
 // The zones must exist before records flow: `valsd admin create-zone records
 // 2 sorted` etc. — see run-bootes.sh in vals-examples.
@@ -203,29 +206,111 @@ func (s *ValsStore) flushBatch(zone string, kvs []valsgo.KV) {
 	}
 }
 
-// flushChunk writes one bounded chunk with bounded retries (a cluster
-// reconfiguration mid-batch surfaces as an error once; the client refreshes
-// and the retry lands).
+const (
+	valsHardRetryLimit = 6
+	valsHardBackoff    = 250 * time.Millisecond
+	valsBusyBackoff    = time.Second
+	valsBusyBackoffCap = 30 * time.Second
+)
+
+type valsRetryPolicy struct {
+	retry        bool
+	backpressure bool
+	refresh      bool
+	delay        time.Duration
+}
+
+type valsRetryState struct {
+	busyAttempts int
+	hardAttempts int
+}
+
+// next keeps Busy and hard-failure budgets independent: any number of healthy
+// backpressure refusals cannot exhaust the bounded hard-failure retry budget.
+func (s *valsRetryState) next(err error, jitter float64) (valsRetryPolicy, int) {
+	attempt := s.hardAttempts
+	if errors.Is(err, valsgo.ErrBusy) {
+		attempt = s.busyAttempts
+		s.busyAttempts++
+	} else {
+		s.hardAttempts++
+	}
+	return valsBatchRetryPolicy(err, attempt, jitter), attempt
+}
+
+// valsBatchRetryPolicy is pure so the lossless Busy policy and bounded hard
+// failure policy can be tested without sleeping. jitter is expected in [0,1).
+func valsBatchRetryPolicy(err error, attempt int, jitter float64) valsRetryPolicy {
+	if errors.Is(err, valsgo.ErrBusy) {
+		// Busy means replicas are healthy but at their maintenance-reserve floor.
+		// Back off for longer than ordinary failures, with ±25% jitter and a cap,
+		// and never select the drop path.
+		delay := exponentialBackoff(valsBusyBackoff, valsBusyBackoffCap, attempt)
+		if jitter < 0 {
+			jitter = 0
+		} else if jitter > 1 {
+			jitter = 1
+		}
+		delay = time.Duration(float64(delay) * (0.75 + 0.5*jitter))
+		if delay > valsBusyBackoffCap {
+			delay = valsBusyBackoffCap
+		}
+		return valsRetryPolicy{retry: true, backpressure: true, delay: delay}
+	}
+	if attempt >= valsHardRetryLimit {
+		return valsRetryPolicy{}
+	}
+	return valsRetryPolicy{
+		retry:   true,
+		refresh: true,
+		delay:   exponentialBackoff(valsHardBackoff, 0, attempt),
+	}
+}
+
+func exponentialBackoff(base, cap time.Duration, attempt int) time.Duration {
+	delay := base
+	for i := 0; i < attempt; i++ {
+		if cap > 0 && delay >= cap/2 {
+			return cap
+		}
+		delay *= 2
+	}
+	if cap > 0 && delay > cap {
+		return cap
+	}
+	return delay
+}
+
+// flushChunk writes one bounded chunk. Cluster reconfiguration and transport
+// failures retain the bounded retry/drop policy; Busy is healthy backpressure,
+// so it retries indefinitely and throttles the producer instead of losing data.
 func (s *ValsStore) flushChunk(zone string, kvs []valsgo.KV) {
 	if len(kvs) == 0 {
 		return
 	}
-	backoff := 250 * time.Millisecond
-	for attempt := 0; ; attempt++ {
+	retries := valsRetryState{}
+	for {
 		err := s.client.PutBatch(zone, kvs)
 		if err == nil {
 			return
 		}
-		if attempt >= 6 {
+		policy, attempt := retries.next(err, rand.Float64())
+		if !policy.retry {
 			s.logger.Error("vals: dropping batch after retries", "zone", zone,
 				"entries", len(kvs), "error", err)
 			return
 		}
-		s.logger.Warn("vals: batch flush failed; retrying", "zone", zone,
-			"entries", len(kvs), "attempt", attempt, "error", err)
-		time.Sleep(backoff)
-		backoff *= 2
-		s.client.Refresh()
+		if policy.backpressure {
+			s.logger.Warn("vals: cluster busy; throttling batch", "zone", zone,
+				"entries", len(kvs), "attempt", attempt, "backoff", policy.delay, "error", err)
+		} else {
+			s.logger.Warn("vals: batch flush failed; retrying", "zone", zone,
+				"entries", len(kvs), "attempt", attempt, "backoff", policy.delay, "error", err)
+		}
+		time.Sleep(policy.delay)
+		if policy.refresh {
+			s.client.Refresh()
+		}
 	}
 }
 
