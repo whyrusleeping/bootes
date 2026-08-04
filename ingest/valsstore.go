@@ -37,19 +37,53 @@ import (
 //
 // The zones must exist before records flow: `valsd admin create-zone records
 // 2 sorted` etc. — see run-bootes.sh in vals-examples.
+type valsClient interface {
+	PutBatch(zone string, kvs []valsgo.KV) error
+	Put(zone string, key, value []byte) (valsgo.Version, error)
+	Delete(zone string, key []byte) (valsgo.Version, error)
+	Get(zone string, key []byte) ([]byte, valsgo.Version, bool, error)
+	Refresh() error
+	ZoneNames() []string
+}
+
 type ValsStore struct {
-	client *valsgo.Client
+	client valsClient
 	logger *slog.Logger
 
-	mu      sync.Mutex
-	drain   *sync.Cond // signalled when a flush frees buffer space
-	records []valsgo.KV
-	links   []valsgo.KV
-	closed  bool
+	mu           sync.Mutex
+	drain        *sync.Cond // signalled when a flush frees buffer space
+	records      []valsgo.KV
+	links        []valsgo.KV
+	closed       bool
+	shutdownCtx  context.Context
+	shutdownWake chan struct{}
+	shutdownOnce sync.Once
 
-	flushNow  chan struct{}
-	done      chan struct{}
-	flushedWg sync.WaitGroup
+	admittedRecords   uint64
+	admittedBacklinks uint64
+	persistedRecords  uint64
+	persistedLinks    uint64
+	droppedRecords    uint64
+	droppedLinks      uint64
+	rejectedRecords   uint64
+	rejectedLinks     uint64
+	inflightRecords   uint64
+	inflightLinks     uint64
+
+	flushNow      chan struct{}
+	done          chan struct{}
+	closeFinished chan struct{}
+	flushedWg     sync.WaitGroup
+}
+
+// ValsShutdownStats is the quantitative final state emitted at shutdown.
+type ValsShutdownStats struct {
+	AdmittedRecords, AdmittedBacklinks   uint64
+	PersistedRecords, PersistedBacklinks uint64
+	DroppedRecords, DroppedBacklinks     uint64
+	RejectedRecords, RejectedBacklinks   uint64
+	BufferedRecords, BufferedBacklinks   uint64
+	InflightRecords, InflightBacklinks   uint64
 }
 
 const (
@@ -84,10 +118,12 @@ func NewValsStore(nodes map[uint32]string, logger *slog.Logger) (*ValsStore, err
 		client.Refresh()
 	}
 	s := &ValsStore{
-		client:   client,
-		logger:   logger,
-		flushNow: make(chan struct{}, 1),
-		done:     make(chan struct{}),
+		client:        client,
+		logger:        logger,
+		flushNow:      make(chan struct{}, 1),
+		done:          make(chan struct{}),
+		closeFinished: make(chan struct{}),
+		shutdownWake:  make(chan struct{}),
 	}
 	s.drain = sync.NewCond(&s.mu)
 	s.flushedWg.Add(1)
@@ -130,7 +166,7 @@ func (s *ValsStore) WriteRecord(r Record) {
 		s.logger.Error("vals: marshal record", "uri", r.URI, "error", err)
 		return
 	}
-	s.push(&s.records, valsgo.KV{Key: recordKey(r.Collection, r.DID, r.Rkey), Value: blob})
+	s.push(&s.records, valsgo.KV{Key: recordKey(r.Collection, r.DID, r.Rkey), Value: blob}, false)
 }
 
 // Write implements BacklinkSink.
@@ -142,11 +178,11 @@ func (s *ValsStore) Write(backlinks []BacklinkRecord) {
 			continue
 		}
 		key := []byte(bl.Ref + "\x00" + bl.SourceURI + "\x00" + bl.Path)
-		s.push(&s.links, valsgo.KV{Key: key, Value: blob})
+		s.push(&s.links, valsgo.KV{Key: key, Value: blob}, true)
 	}
 }
 
-func (s *ValsStore) push(buf *[]valsgo.KV, kv valsgo.KV) {
+func (s *ValsStore) push(buf *[]valsgo.KV, kv valsgo.KV, backlink bool) {
 	s.mu.Lock()
 	// Backpressure: if the buffers are already at their hard cap the flusher is
 	// behind (slow cluster or mid-retry). Block the producer until a flush
@@ -156,7 +192,21 @@ func (s *ValsStore) push(buf *[]valsgo.KV, kv valsgo.KV) {
 	for !s.closed && len(s.records)+len(s.links) >= valsBufferCap {
 		s.drain.Wait()
 	}
+	if s.closed {
+		if backlink {
+			s.rejectedLinks++
+		} else {
+			s.rejectedRecords++
+		}
+		s.mu.Unlock()
+		return
+	}
 	*buf = append(*buf, kv)
+	if backlink {
+		s.admittedBacklinks++
+	} else {
+		s.admittedRecords++
+	}
 	full := len(s.records)+len(s.links) >= valsFlushSize
 	s.mu.Unlock()
 	if full {
@@ -187,6 +237,8 @@ func (s *ValsStore) flush() {
 	s.mu.Lock()
 	records, links := s.records, s.links
 	s.records, s.links = nil, nil
+	s.inflightRecords += uint64(len(records))
+	s.inflightLinks += uint64(len(links))
 	s.drain.Broadcast() // buffer space freed — wake any producers blocked in push
 	s.mu.Unlock()
 	s.flushBatch(valsRecordZone, records)
@@ -202,7 +254,28 @@ func (s *ValsStore) flushBatch(zone string, kvs []valsgo.KV) {
 		if end > len(kvs) {
 			end = len(kvs)
 		}
-		s.flushChunk(zone, kvs[start:end])
+		persisted := s.flushChunk(zone, kvs[start:end])
+		s.accountChunk(zone, uint64(end-start), persisted)
+	}
+}
+
+func (s *ValsStore) accountChunk(zone string, entries uint64, persisted bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if zone == valsRecordZone {
+		s.inflightRecords -= entries
+		if persisted {
+			s.persistedRecords += entries
+		} else {
+			s.droppedRecords += entries
+		}
+	} else {
+		s.inflightLinks -= entries
+		if persisted {
+			s.persistedLinks += entries
+		} else {
+			s.droppedLinks += entries
+		}
 	}
 }
 
@@ -284,21 +357,21 @@ func exponentialBackoff(base, cap time.Duration, attempt int) time.Duration {
 // flushChunk writes one bounded chunk. Cluster reconfiguration and transport
 // failures retain the bounded retry/drop policy; Busy is healthy backpressure,
 // so it retries indefinitely and throttles the producer instead of losing data.
-func (s *ValsStore) flushChunk(zone string, kvs []valsgo.KV) {
+func (s *ValsStore) flushChunk(zone string, kvs []valsgo.KV) bool {
 	if len(kvs) == 0 {
-		return
+		return true
 	}
 	retries := valsRetryState{}
 	for {
 		err := s.client.PutBatch(zone, kvs)
 		if err == nil {
-			return
+			return true
 		}
 		policy, attempt := retries.next(err, rand.Float64())
 		if !policy.retry {
 			s.logger.Error("vals: dropping batch after retries", "zone", zone,
 				"entries", len(kvs), "error", err)
-			return
+			return false
 		}
 		if policy.backpressure {
 			s.logger.Warn("vals: cluster busy; throttling batch", "zone", zone,
@@ -307,11 +380,57 @@ func (s *ValsStore) flushChunk(zone string, kvs []valsgo.KV) {
 			s.logger.Warn("vals: batch flush failed; retrying", "zone", zone,
 				"entries", len(kvs), "attempt", attempt, "backoff", policy.delay, "error", err)
 		}
-		time.Sleep(policy.delay)
+		ctx, wake := s.flushContext()
+		timer := time.NewTimer(policy.delay)
+		select {
+		case <-timer.C:
+		case <-wake:
+			if !timer.Stop() {
+				<-timer.C
+			}
+			ctx, _ = s.flushContext()
+			select {
+			case <-ctx.Done():
+				s.logger.Error("vals: dropping batch at shutdown deadline", "zone", zone,
+					"entries", len(kvs), "error", ctx.Err())
+				return false
+			default:
+				// Shutdown began while this backoff was sleeping. Retry immediately;
+				// subsequent waits select the shared deadline.
+				continue
+			}
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			s.logger.Error("vals: dropping batch at shutdown deadline", "zone", zone,
+				"entries", len(kvs), "error", ctx.Err())
+			return false
+		}
 		if policy.refresh {
 			s.client.Refresh()
 		}
 	}
+}
+
+func (s *ValsStore) flushContext() (context.Context, <-chan struct{}) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.shutdownCtx != nil {
+		return s.shutdownCtx, nil
+	}
+	return context.Background(), s.shutdownWake
+}
+
+// BeginShutdown installs the one shared deadline and wakes retry sleeps that
+// started before shutdown. Producers may continue until Ingester quiesces them.
+func (s *ValsStore) BeginShutdown(ctx context.Context) {
+	s.mu.Lock()
+	if s.shutdownCtx == nil {
+		s.shutdownCtx = ctx
+	}
+	s.mu.Unlock()
+	s.shutdownOnce.Do(func() { close(s.shutdownWake) })
 }
 
 // QueueRecordDelete implements DeleteSink: a direct vals tombstone.
@@ -349,22 +468,84 @@ func (s *ValsStore) LoadCursor(ctx context.Context) (int64, error) {
 
 // SaveCursor implements CursorStore.
 func (s *ValsStore) SaveCursor(ctx context.Context, cursor int64) error {
-	_, err := s.client.Put("", []byte(valsCursorKey), []byte(strconv.FormatInt(cursor, 10)))
-	return err
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.client.Put("", []byte(valsCursorKey), []byte(strconv.FormatInt(cursor, 10)))
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		s.logger.Error("vals: cursor persistence deadline expired", "cursor", cursor, "error", ctx.Err())
+		return ctx.Err()
+	}
 }
 
-// Close drains the buffers. Safe to call once per sink role (the ingester
-// closes each of its sinks; they all alias this store).
-func (s *ValsStore) Close() error {
+// Close preserves the sink interface. Production shutdown uses CloseContext.
+func (s *ValsStore) Close() error { return s.CloseContext(context.Background()) }
+
+// CloseContext rejects new writes immediately, drains against ctx, and returns
+// an error if anything was dropped, rejected, or remained at the deadline.
+func (s *ValsStore) CloseContext(ctx context.Context) error {
+	s.BeginShutdown(ctx)
 	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
-		return nil
+	if !s.closed {
+		s.closed = true
+		s.drain.Broadcast()
+		close(s.done)
+		go func() { s.flushedWg.Wait(); close(s.closeFinished) }()
 	}
-	s.closed = true
-	s.drain.Broadcast() // release any producers blocked on the buffer cap
+	finished := s.closeFinished
 	s.mu.Unlock()
-	close(s.done)
-	s.flushedWg.Wait()
+
+	var waitErr error
+	select {
+	case <-finished:
+	case <-ctx.Done():
+		waitErr = ctx.Err()
+	}
+	stats := s.Stats()
+	s.logger.Info("vals shutdown summary",
+		"admitted_records", stats.AdmittedRecords, "persisted_records", stats.PersistedRecords,
+		"buffered_records", stats.BufferedRecords, "inflight_records", stats.InflightRecords,
+		"dropped_records", stats.DroppedRecords, "rejected_records", stats.RejectedRecords,
+		"admitted_backlinks", stats.AdmittedBacklinks, "persisted_backlinks", stats.PersistedBacklinks,
+		"buffered_backlinks", stats.BufferedBacklinks, "inflight_backlinks", stats.InflightBacklinks,
+		"dropped_backlinks", stats.DroppedBacklinks, "rejected_backlinks", stats.RejectedBacklinks,
+		"deadline_expired", waitErr != nil)
+	remaining := stats.BufferedRecords + stats.BufferedBacklinks + stats.InflightRecords + stats.InflightBacklinks
+	lost := stats.DroppedRecords + stats.DroppedBacklinks + stats.RejectedRecords + stats.RejectedBacklinks
+	if waitErr != nil {
+		return fmt.Errorf("vals drain incomplete: remaining=%d lost=%d: %w", remaining, lost, waitErr)
+	}
+	if remaining != 0 || lost != 0 {
+		return fmt.Errorf("vals drain incomplete: remaining=%d lost=%d", remaining, lost)
+	}
 	return nil
+}
+
+func (s *ValsStore) ReportShutdownIncomplete(reason error) {
+	stats := s.Stats()
+	s.logger.Error("vals shutdown incomplete before drain; producers still active",
+		"reason", reason,
+		"admitted_records", stats.AdmittedRecords, "persisted_records", stats.PersistedRecords,
+		"buffered_records", stats.BufferedRecords, "inflight_records", stats.InflightRecords,
+		"dropped_records", stats.DroppedRecords, "rejected_records", stats.RejectedRecords,
+		"admitted_backlinks", stats.AdmittedBacklinks, "persisted_backlinks", stats.PersistedBacklinks,
+		"buffered_backlinks", stats.BufferedBacklinks, "inflight_backlinks", stats.InflightBacklinks,
+		"dropped_backlinks", stats.DroppedBacklinks, "rejected_backlinks", stats.RejectedBacklinks)
+}
+
+func (s *ValsStore) Stats() ValsShutdownStats {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return ValsShutdownStats{
+		AdmittedRecords: s.admittedRecords, AdmittedBacklinks: s.admittedBacklinks,
+		PersistedRecords: s.persistedRecords, PersistedBacklinks: s.persistedLinks,
+		DroppedRecords: s.droppedRecords, DroppedBacklinks: s.droppedLinks,
+		RejectedRecords: s.rejectedRecords, RejectedBacklinks: s.rejectedLinks,
+		BufferedRecords: uint64(len(s.records)), BufferedBacklinks: uint64(len(s.links)),
+		InflightRecords: s.inflightRecords, InflightBacklinks: s.inflightLinks,
+	}
 }

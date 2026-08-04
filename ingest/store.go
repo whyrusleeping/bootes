@@ -30,3 +30,22 @@ type CursorStore interface {
 	LoadCursor(ctx context.Context) (int64, error)
 	SaveCursor(ctx context.Context, cursor int64) error
 }
+
+// ContextCloser lets a sink drain against the ingester's single shutdown
+// deadline. Sinks that do not implement it retain their legacy Close method.
+type ContextCloser interface {
+	CloseContext(ctx context.Context) error
+}
+
+// ShutdownNotifier gives a buffered sink the shared deadline before producer
+// quiescence. It may interrupt retries, but must not emit its final summary or
+// persist cursor state; CloseContext does that after producers have stopped.
+type ShutdownNotifier interface {
+	BeginShutdown(ctx context.Context)
+}
+
+// ShutdownReporter emits a quantitative snapshot when producers could not be
+// quiesced and closing the sink would therefore be unsafe.
+type ShutdownReporter interface {
+	ReportShutdownIncomplete(reason error)
+}

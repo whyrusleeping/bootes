@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -12,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -119,6 +121,12 @@ func main() {
 				Usage:   "Path to log file (logs go to both stdout and file)",
 				Sources: cli.EnvVars("ATTIE_LOG_FILE"),
 			},
+			&cli.DurationFlag{
+				Name:    "shutdown-timeout",
+				Value:   30 * time.Second,
+				Usage:   "Maximum total graceful shutdown time before exiting with loss diagnostics",
+				Sources: cli.EnvVars("ATTIE_SHUTDOWN_TIMEOUT"),
+			},
 		},
 		Action: run,
 	}
@@ -192,6 +200,10 @@ func run(ctx context.Context, cmd *cli.Command) error {
 	relayURL := cmd.String("relay")
 	parallelBackfills := cmd.Int("parallel-backfills")
 	metricsAddr := cmd.String("metrics-addr")
+	shutdownTimeout := cmd.Duration("shutdown-timeout")
+	if shutdownTimeout <= 0 {
+		return fmt.Errorf("--shutdown-timeout must be positive")
+	}
 
 	// Set up Prometheus metrics exporter via OTel SDK
 	exporter, err := promexporter.New()
@@ -293,25 +305,69 @@ func run(ctx context.Context, cmd *cli.Command) error {
 
 	logger.Info("firehose ingester started", "metrics", metricsAddr)
 
+	runExited := false
 	select {
 	case err := <-errCh:
-		// Unexpected error — still do graceful shutdown
-		logger.Error("ingester exited with error", "error", err)
+		runExited = true
+		// Unexpected error — still do bounded graceful shutdown.
+		if err != nil && !errors.Is(err, context.Canceled) {
+			logger.Error("ingester exited with error", "error", err)
+		}
 	case sig := <-sigCh:
-		logger.Info("received signal, shutting down gracefully (send again to force quit)", "signal", sig)
-		cancel()
+		logger.Info("received signal; stopping admission and beginning bounded shutdown",
+			"signal", sig, "shutdown_timeout", shutdownTimeout,
+			"force_hint", "send another signal to force quit")
+	}
 
-		// Wait for Run to exit, but force quit on second signal
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer shutdownCancel()
+	ingester.BeginShutdown(shutdownCtx)
+	cancel() // immediately stop firehose and repo-pump admission
+	if !runExited {
 		select {
-		case <-errCh:
+		case err := <-errCh:
+			if err != nil && !errors.Is(err, context.Canceled) {
+				logger.Warn("ingester run stopped during shutdown", "error", err)
+			}
 		case sig := <-sigCh:
 			logger.Warn("received second signal, force quitting", "signal", sig)
 			os.Exit(1)
+			return nil
+		case <-shutdownCtx.Done():
+			// CloseContext owns the producer-quiescence diagnostics and quantitative
+			// vals snapshot. Invoke it with the already-expired shared context; it
+			// must not close sinks or save the cursor.
+			if err := ingester.CloseContext(shutdownCtx); err != nil {
+				return fmt.Errorf("producer quiescence: %w", err)
+			}
+			return fmt.Errorf("producer quiescence: %w", shutdownCtx.Err())
 		}
 	}
-
-	// Always do graceful shutdown — don't rely on defer
-	ingester.Close()
-
-	return nil
+	closeCh := make(chan error, 1)
+	go func() { closeCh <- ingester.CloseContext(shutdownCtx) }()
+	select {
+	case err := <-closeCh:
+		if err != nil {
+			return fmt.Errorf("shutdown incomplete: %w", err)
+		}
+		return nil
+	case sig := <-sigCh:
+		logger.Warn("received second signal, force quitting", "signal", sig)
+		os.Exit(1)
+		return nil // unreachable; keeps the signal branch explicit to the compiler
+	case <-shutdownCtx.Done():
+		// CloseContext observes this same deadline and emits the quantitative
+		// summary before returning. Give it a small, fixed reporting grace; this
+		// remains a process-level guard against a buggy sink implementation.
+		select {
+		case err := <-closeCh:
+			if err != nil {
+				return fmt.Errorf("shutdown incomplete: %w", err)
+			}
+			return nil
+		case <-time.After(time.Second):
+			logger.Error("shutdown deadline expired; force exiting", "error", shutdownCtx.Err())
+			return fmt.Errorf("shutdown deadline: %w", shutdownCtx.Err())
+		}
+	}
 }

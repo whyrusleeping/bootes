@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"log/slog"
@@ -45,6 +46,7 @@ type Ingester struct {
 	disableBackfill bool
 	store           *backfill.Gormstore
 	backfiller      *backfill.Backfiller
+	stopBackfiller  func(context.Context) error
 	logger          *slog.Logger
 	metrics         *Metrics
 	httpClient      *http.Client
@@ -56,6 +58,10 @@ type Ingester struct {
 	cursor     int64
 	cursorMu   sync.RWMutex
 	cursorDone chan struct{}
+
+	admissionMu     sync.Mutex
+	admissionClosed bool
+	activeWork      sync.WaitGroup
 
 	parallelBackfills int
 
@@ -161,6 +167,7 @@ func NewIngester(cfg Config, writer RecordSink, backlinkWriter BacklinkSink, del
 		ing.handleBackfillDelete,
 		opts,
 	)
+	ing.stopBackfiller = ing.backfiller.Stop
 
 	return ing, nil
 }
@@ -177,8 +184,12 @@ func (i *Ingester) Run(ctx context.Context) error {
 		i.logger.Warn("failed to load cursor from clickhouse, starting from latest", "error", err)
 	}
 
-	// Start cursor saver
-	go i.cursorSaver(ctx)
+	// Context-closing stores (currently vals) buffer writes. Persisting their
+	// cursor periodically could put it ahead of undrained data, so they only save
+	// the cursor after the final successful drain in CloseContext.
+	if _, buffered := i.cursors.(ContextCloser); !buffered {
+		go i.cursorSaver(ctx)
+	}
 
 	// Start backfill processor + initial repo pump (unless firehose-only)
 	if !i.disableBackfill {
@@ -400,8 +411,72 @@ func (i *Ingester) consumeFirehose(ctx context.Context) error {
 	return events.HandleRepoStream(ctx, conn, scheduler, i.logger)
 }
 
-// handleEvent processes a single firehose event
+func (i *Ingester) beginWork() bool {
+	i.admissionMu.Lock()
+	defer i.admissionMu.Unlock()
+	if i.admissionClosed {
+		return false
+	}
+	i.activeWork.Add(1)
+	return true
+}
+
+func (i *Ingester) endWork() { i.activeWork.Done() }
+
+// StopAdmission prevents callbacks that were queued but not started from
+// becoming producers. Already-active callbacks remain counted until return.
+func (i *Ingester) StopAdmission() {
+	i.admissionMu.Lock()
+	i.admissionClosed = true
+	i.admissionMu.Unlock()
+}
+
+func (i *Ingester) waitForActiveWork(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() { i.activeWork.Wait(); close(done) }()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// BeginShutdown immediately stops callback admission and notifies buffered
+// sinks so an already-sleeping retry switches to the shared deadline.
+func (i *Ingester) BeginShutdown(ctx context.Context) {
+	i.StopAdmission()
+	seen := make(map[any]bool)
+	for _, sink := range []any{i.writer, i.backlinkWriter, i.deleteQueue} {
+		if sink == nil || seen[sink] {
+			continue
+		}
+		seen[sink] = true
+		if notifier, ok := sink.(ShutdownNotifier); ok {
+			notifier.BeginShutdown(ctx)
+		}
+	}
+}
+
+func (i *Ingester) reportUnclosedSinks(reason error) {
+	seen := make(map[any]bool)
+	for _, sink := range []any{i.writer, i.backlinkWriter, i.deleteQueue} {
+		if sink == nil || seen[sink] {
+			continue
+		}
+		seen[sink] = true
+		if reporter, ok := sink.(ShutdownReporter); ok {
+			reporter.ReportShutdownIncomplete(reason)
+		}
+	}
+}
+
+// handleEvent processes a single firehose event.
 func (i *Ingester) handleEvent(ctx context.Context, evt *events.XRPCStreamEvent) error {
+	if !i.beginWork() {
+		return context.Canceled
+	}
+	defer i.endWork()
 	i.metrics.FirehoseEvents.Add(ctx, 1)
 	switch {
 	case evt.RepoCommit != nil:
@@ -497,6 +572,14 @@ func (i *Ingester) handleIdentity(ctx context.Context, identity *comatproto.Sync
 
 // handleBackfillCreate handles record creates during backfill
 func (i *Ingester) handleBackfillCreate(ctx context.Context, repo string, rev string, path string, rec *[]byte, cidVal *cid.Cid) error {
+	if !i.beginWork() {
+		return context.Canceled
+	}
+	defer i.endWork()
+	return i.handleBackfillCreateActive(ctx, repo, rev, path, rec, cidVal)
+}
+
+func (i *Ingester) handleBackfillCreateActive(ctx context.Context, repo string, rev string, path string, rec *[]byte, cidVal *cid.Cid) error {
 	parts := strings.SplitN(path, "/", 2)
 	if len(parts) != 2 {
 		return nil
@@ -515,11 +598,19 @@ func (i *Ingester) handleBackfillCreate(ctx context.Context, repo string, rev st
 
 // handleBackfillUpdate handles record updates during backfill
 func (i *Ingester) handleBackfillUpdate(ctx context.Context, repo string, rev string, path string, rec *[]byte, cidVal *cid.Cid) error {
-	return i.handleBackfillCreate(ctx, repo, rev, path, rec, cidVal)
+	if !i.beginWork() {
+		return context.Canceled
+	}
+	defer i.endWork()
+	return i.handleBackfillCreateActive(ctx, repo, rev, path, rec, cidVal)
 }
 
 // handleBackfillDelete handles record deletes during backfill
 func (i *Ingester) handleBackfillDelete(ctx context.Context, repo string, rev string, path string) error {
+	if !i.beginWork() {
+		return context.Canceled
+	}
+	defer i.endWork()
 	uri := fmt.Sprintf("at://%s/%s", repo, path)
 	// Queue deletions for periodic cleanup (avoids mutation overhead)
 	if i.deleteQueue != nil {
@@ -608,26 +699,31 @@ func (i *Ingester) cursorSaver(ctx context.Context) {
 	}
 }
 
-// saveCursor saves the current cursor value (used during shutdown)
-func (i *Ingester) saveCursor() {
+// saveCursor saves the current cursor value (used during shutdown).
+func (i *Ingester) saveCursor(ctx context.Context) error {
 	i.cursorMu.RLock()
 	cursor := i.cursor
 	i.cursorMu.RUnlock()
 
-	if cursor > 0 {
-		if err := i.persistCursor(cursor); err != nil {
-			i.logger.Error("failed to save cursor on shutdown", "error", err, "seq", cursor)
-		} else {
-			i.logger.Info("cursor saved on shutdown", "seq", cursor)
-		}
+	if cursor == 0 {
+		return nil
 	}
+	if err := i.persistCursorContext(ctx, cursor); err != nil {
+		i.logger.Error("failed to save cursor on shutdown", "error", err, "seq", cursor)
+		return err
+	}
+	i.logger.Info("cursor saved on shutdown", "seq", cursor)
+	return nil
 }
 
-// persistCursor writes the cursor to ClickHouse
+// persistCursor writes the cursor to ClickHouse.
 func (i *Ingester) persistCursor(cursor int64) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	return i.persistCursorContext(ctx, cursor)
+}
 
+func (i *Ingester) persistCursorContext(ctx context.Context, cursor int64) error {
 	if i.cursors != nil {
 		return i.cursors.SaveCursor(ctx, cursor)
 	}
@@ -660,42 +756,86 @@ func (i *Ingester) writeBacklinks(backlinks []Backlink, collection, sourceURI, s
 	i.backlinkWriter.Write(records)
 }
 
-// Close shuts down the ingester gracefully, flushing all pending data.
-// Order: stop backfiller -> flush writers -> save final cursor.
-// This ensures the cursor is never ahead of flushed data.
-func (i *Ingester) Close() error {
+// CloseContext shuts down under one caller-owned deadline. The cursor is only
+// advanced after every distinct sink reports a successful drain.
+func (i *Ingester) CloseContext(ctx context.Context) error {
 	i.logger.Info("shutting down ingester...")
+	select {
+	case <-i.cursorDone:
+	default:
+		close(i.cursorDone)
+	}
 
-	// Stop backfiller first (it produces records)
-	// Give it enough time to finish in-flight repo downloads
-	if !i.disableBackfill {
+	i.BeginShutdown(ctx)
+	var errs []error
+	if !i.disableBackfill && i.stopBackfiller != nil {
 		i.logger.Info("stopping backfiller...")
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-		defer cancel()
-		i.backfiller.Stop(ctx)
+		if err := i.stopBackfiller(ctx); err != nil {
+			err = fmt.Errorf("stop backfiller: %w", err)
+			i.reportUnclosedSinks(err)
+			i.logger.Error("final cursor persistence withheld: producers not quiesced", "error", err)
+			i.logger.Error("ingester shutdown incomplete", "error", err, "deadline_expired", ctx.Err() != nil)
+			return err
+		}
+	}
+	if err := i.waitForActiveWork(ctx); err != nil {
+		err = fmt.Errorf("wait for active producers: %w", err)
+		i.reportUnclosedSinks(err)
+		i.logger.Error("final cursor persistence withheld: producers not quiesced", "error", err)
+		i.logger.Error("ingester shutdown incomplete", "error", err, "deadline_expired", true)
+		return err
 	}
 
-	// Flush and close writers (order matters - flush data before delete queue)
-	if i.writer != nil {
-		i.logger.Info("flushing record writer...")
-		i.writer.Close()
+	// Vals aliases all roles to one object; close each unique interface once.
+	seen := make(map[any]bool)
+	for _, sink := range []any{i.writer, i.backlinkWriter, i.deleteQueue} {
+		if sink == nil || seen[sink] {
+			continue
+		}
+		seen[sink] = true
+		var err error
+		if closer, ok := sink.(ContextCloser); ok {
+			err = closer.CloseContext(ctx)
+		} else {
+			done := make(chan error, 1)
+			go func(v any) {
+				switch s := v.(type) {
+				case RecordSink:
+					done <- s.Close()
+				case BacklinkSink:
+					done <- s.Close()
+				case DeleteSink:
+					done <- s.Close()
+				}
+			}(sink)
+			select {
+			case err = <-done:
+			case <-ctx.Done():
+				err = ctx.Err()
+			}
+		}
+		if err != nil {
+			errs = append(errs, fmt.Errorf("drain sink: %w", err))
+		}
 	}
 
-	if i.backlinkWriter != nil {
-		i.logger.Info("flushing backlink writer...")
-		i.backlinkWriter.Close()
+	if len(errs) == 0 {
+		if err := i.saveCursor(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("persist cursor: %w", err))
+		}
+	} else {
+		i.logger.Error("final cursor persistence withheld: data drain incomplete", "errors", errors.Join(errs...))
 	}
-
-	if i.deleteQueue != nil {
-		i.logger.Info("flushing delete queue...")
-		i.deleteQueue.Close()
+	if err := errors.Join(errs...); err != nil {
+		i.logger.Error("ingester shutdown incomplete", "error", err, "deadline_expired", ctx.Err() != nil)
+		return err
 	}
-
-	// Save cursor AFTER writers are flushed, so we never skip data on restart
-	i.logger.Info("saving final cursor...")
-	i.saveCursor()
-	close(i.cursorDone)
-
 	i.logger.Info("ingester shutdown complete")
 	return nil
+}
+
+func (i *Ingester) Close() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return i.CloseContext(ctx)
 }
