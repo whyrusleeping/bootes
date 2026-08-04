@@ -82,8 +82,14 @@ func main() {
 			&cli.IntFlag{
 				Name:    "parallel-backfills",
 				Value:   0,
-				Usage:   "Number of parallel backfills (default: 50)",
+				Usage:   "Number of active backfill jobs (default: 300)",
 				Sources: cli.EnvVars("ATTIE_PARALLEL_BACKFILLS"),
+			},
+			&cli.IntFlag{
+				Name:    "parallel-downloads",
+				Value:   0,
+				Usage:   "Maximum concurrent repo downloads/CAR walks (default: 64; bounds memory while jobs remain parallel)",
+				Sources: cli.EnvVars("ATTIE_PARALLEL_DOWNLOADS"),
 			},
 			&cli.StringFlag{
 				Name:    "metrics-addr",
@@ -199,6 +205,7 @@ func run(ctx context.Context, cmd *cli.Command) error {
 	backfillDB := cmd.String("backfill-db")
 	relayURL := cmd.String("relay")
 	parallelBackfills := cmd.Int("parallel-backfills")
+	parallelDownloads := cmd.Int("parallel-downloads")
 	metricsAddr := cmd.String("metrics-addr")
 	shutdownTimeout := cmd.Duration("shutdown-timeout")
 	if shutdownTimeout <= 0 {
@@ -282,6 +289,7 @@ func run(ctx context.Context, cmd *cli.Command) error {
 		RelayURL:          relayURL,
 		BackfillDBPath:    backfillDB,
 		ParallelBackfills: parallelBackfills,
+		ParallelDownloads: parallelDownloads,
 		ClickHouseConn:    conn,
 		Metrics:           metrics,
 		Cursors:           cursors,

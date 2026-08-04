@@ -28,7 +28,8 @@ import (
 const (
 	DefaultRelayURL          = "wss://bsky.network"
 	CursorSaveInterval       = 5 * time.Second
-	DefaultParallelBackfills = 50
+	DefaultParallelBackfills = 300
+	DefaultParallelDownloads = 64
 )
 
 // SelfLabelStore is the interface needed to persist self-labels extracted from posts.
@@ -79,6 +80,7 @@ type Config struct {
 	RelayURL          string
 	BackfillDBPath    string
 	ParallelBackfills int
+	ParallelDownloads int
 	ClickHouseConn    driver.Conn
 	Metrics           *Metrics
 	LabelStore        SelfLabelStore
@@ -102,6 +104,12 @@ func NewIngester(cfg Config, writer RecordSink, backlinkWriter BacklinkSink, del
 	}
 	if cfg.ParallelBackfills == 0 {
 		cfg.ParallelBackfills = DefaultParallelBackfills
+	}
+	if cfg.ParallelDownloads == 0 {
+		cfg.ParallelDownloads = DefaultParallelDownloads
+	}
+	if cfg.ParallelDownloads > cfg.ParallelBackfills {
+		cfg.ParallelDownloads = cfg.ParallelBackfills
 	}
 
 	store, db, err := NewBackfillStore(cfg.BackfillDBPath)
@@ -140,6 +148,7 @@ func NewIngester(cfg Config, writer RecordSink, backlinkWriter BacklinkSink, del
 	// Create backfiller with indigo's backfill package
 	opts := backfill.DefaultBackfillOptions()
 	opts.ParallelBackfills = cfg.ParallelBackfills
+	opts.ParallelDownloads = cfg.ParallelDownloads
 	opts.ParallelRecordCreates = 40
 	opts.SyncRequestsPerSecond = 500
 	opts.PDSRequestsPerSecond = 10

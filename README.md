@@ -41,7 +41,8 @@ All flags can also be set via environment variables:
 | `--clickhouse-readonly-password` | `ATTIE_CLICKHOUSE_READONLY_PASSWORD` | | Read-only user password |
 | `--relay` | `ATTIE_RELAY` | `wss://bsky.network` | Relay WebSocket URL |
 | `--backfill-db` | `ATTIE_BACKFILL_DB` | `backfill.db` | Backfill state DB (file path for SQLite, or `postgres://` URI) |
-| `--parallel-backfills` | `ATTIE_PARALLEL_BACKFILLS` | `50` | Number of parallel backfill workers |
+| `--parallel-backfills` | `ATTIE_PARALLEL_BACKFILLS` | `300` | Number of active backfill jobs |
+| `--parallel-downloads` | `ATTIE_PARALLEL_DOWNLOADS` | `64` | Maximum concurrent repo downloads/CAR walks (bounds streaming memory independently of active jobs) |
 | `--metrics-addr` | `ATTIE_METRICS_ADDR` | `:9090` | Prometheus metrics / pprof address |
 | `--log-file` | `ATTIE_LOG_FILE` | | Also write logs to this file |
 
