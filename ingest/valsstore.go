@@ -241,8 +241,22 @@ func (s *ValsStore) flush() {
 	s.inflightLinks += uint64(len(links))
 	s.drain.Broadcast() // buffer space freed — wake any producers blocked in push
 	s.mu.Unlock()
-	s.flushBatch(valsRecordZone, records)
-	s.flushBatch(valsBacklinkZone, links)
+
+	// Records and backlinks are independent zones backed by independent engines.
+	// Draining them serially left the cluster mostly idle: one PutBatch waited for
+	// all destination replies before the other zone could even start. Preserve
+	// order within each zone, but overlap the two zone drains.
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		s.flushBatch(valsRecordZone, records)
+	}()
+	go func() {
+		defer wg.Done()
+		s.flushBatch(valsBacklinkZone, links)
+	}()
+	wg.Wait()
 }
 
 // flushBatch writes a buffered batch, split into PutBatch calls of at most
