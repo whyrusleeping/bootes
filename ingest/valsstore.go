@@ -91,7 +91,7 @@ const (
 	valsBacklinkZone = "backlinks"
 	valsCursorKey    = "cursor/firehose"
 	valsFlushSize    = 2000  // soft: signal a flush once this many entries are buffered
-	valsMaxBatch     = 5000  // hard: max entries per PutBatch call (bounds per-call memory)
+	valsMaxBatch     = 1000  // bounds one hot destination's staged LWW work below the RPC timeout
 	valsBufferCap    = 50000 // hard: total buffered entries before push() blocks (backpressure)
 	valsFlushAge     = 2 * time.Second
 )
